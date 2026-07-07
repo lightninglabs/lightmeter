@@ -12,9 +12,9 @@ import (
 func newTestStore(t *testing.T) *SQLiteStore {
 	t.Helper()
 
-	s, err := NewSQLiteStore(
-		filepath.Join(t.TempDir(), "test.db"), 0,
-	)
+	s, err := NewSQLiteStore(StoreConfig{
+		Path: filepath.Join(t.TempDir(), "test.db"),
+	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 
@@ -148,7 +148,7 @@ func TestReservationExpiry(t *testing.T) {
 func TestPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 
-	s, err := NewSQLiteStore(path, 0)
+	s, err := NewSQLiteStore(StoreConfig{Path: path})
 	require.NoError(t, err)
 
 	_, err = s.Book("token", "glm", 1000, 1500)
@@ -159,7 +159,7 @@ func TestPersistence(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
 
-	reloaded, err := NewSQLiteStore(path, 0)
+	reloaded, err := NewSQLiteStore(StoreConfig{Path: path})
 	require.NoError(t, err)
 	defer func() { require.NoError(t, reloaded.Close()) }()
 
@@ -198,9 +198,10 @@ func TestExpireStale(t *testing.T) {
 
 // TestUnauthorizedEviction checks the cap on never-authorized bundles.
 func TestUnauthorizedEviction(t *testing.T) {
-	s, err := NewSQLiteStore(
-		filepath.Join(t.TempDir(), "test.db"), 2,
-	)
+	s, err := NewSQLiteStore(StoreConfig{
+		Path:            filepath.Join(t.TempDir(), "test.db"),
+		MaxUnauthorized: 2,
+	})
 	require.NoError(t, err)
 	defer func() { require.NoError(t, s.Close()) }()
 
@@ -229,6 +230,96 @@ func TestUnauthorizedEviction(t *testing.T) {
 
 	_, ok := s.Get("paid")
 	require.True(t, ok)
+}
+
+// TestEvictionAgeFloor checks that never-authorized bundles younger than
+// the eviction age floor are immune to count-based eviction, so a
+// mint-spam burst cannot push out a just-paid bundle before its first
+// authorized request.
+func TestEvictionAgeFloor(t *testing.T) {
+	s, err := NewSQLiteStore(StoreConfig{
+		Path:            filepath.Join(t.TempDir(), "test.db"),
+		MaxUnauthorized: 2,
+		MinEvictionAge:  10 * time.Minute,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close()) }()
+
+	// Four fresh un-paid bundles exceed the cap, but all are younger
+	// than the floor, so none is evicted.
+	for _, id := range []string{"a", "b", "c", "d"} {
+		_, err := s.Book(id, "glm", 1000, 1500)
+		require.NoError(t, err)
+	}
+	for _, id := range []string{"a", "b", "c", "d"} {
+		_, ok := s.Get(id)
+		require.True(t, ok)
+	}
+
+	// Age two of them past the floor. The next booking finds an excess
+	// of three over the cap, but only the two aged bundles are
+	// candidates, so exactly those are evicted.
+	old := time.Now().Add(-time.Hour).Unix()
+	_, err = s.db.Exec(
+		`UPDATE bundles SET created_at = ?
+		 WHERE token_id IN ('a', 'b')`,
+		old,
+	)
+	require.NoError(t, err)
+
+	_, err = s.Book("e", "glm", 1000, 1500)
+	require.NoError(t, err)
+
+	for _, id := range []string{"a", "b"} {
+		_, ok := s.Get(id)
+		require.False(t, ok)
+	}
+	for _, id := range []string{"c", "d", "e"} {
+		_, ok := s.Get(id)
+		require.True(t, ok)
+	}
+}
+
+// TestEventRetention checks that the periodic sweep prunes old usage and
+// provider events while leaving bundles untouched.
+func TestEventRetention(t *testing.T) {
+	s, err := NewSQLiteStore(StoreConfig{
+		Path:      filepath.Join(t.TempDir(), "test.db"),
+		Retention: 24 * time.Hour,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close()) }()
+
+	_, err = s.Book("token", "glm", 1000, 1500)
+	require.NoError(t, err)
+	_, _, err = s.Debit("token", 100, 0)
+	require.NoError(t, err)
+	require.NoError(t, s.RecordProviderEvent(ProviderEvent{
+		EventID:     "ev-1",
+		Model:       "glm",
+		TotalTokens: 100,
+		Raw:         []byte(`{}`),
+	}))
+
+	// Backdate the events past the retention window, then run the sweep
+	// through ExpireStale (a fresh store has never pruned, so the first
+	// call sweeps).
+	old := time.Now().Add(-48 * time.Hour).Unix()
+	_, err = s.db.Exec(`UPDATE usage_events SET created_at = ?`, old)
+	require.NoError(t, err)
+	_, err = s.db.Exec(`UPDATE provider_events SET received_at = ?`, old)
+	require.NoError(t, err)
+
+	s.ExpireStale(time.Hour)
+
+	report, err := s.ReconReport(time.Unix(0, 0))
+	require.NoError(t, err)
+	require.Empty(t, report)
+
+	// The bundle itself survives: only event tables are pruned.
+	b, ok := s.Get("token")
+	require.True(t, ok)
+	require.EqualValues(t, 900, b.RemainingTokens)
 }
 
 // TestReconReport checks the usage ledger against ingested provider

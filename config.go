@@ -42,6 +42,10 @@ const (
 	// mounted on.
 	DefaultWebhookPath = "/webhooks/baseten"
 
+	// DefaultRetentionDays is how many days of usage and provider
+	// billing events are retained by default.
+	DefaultRetentionDays = 90
+
 	// maxMarginPercent is the sanity ceiling on the configured margin.
 	maxMarginPercent = 10_000.0
 
@@ -168,6 +172,11 @@ type Config struct {
 	// retained before it is reaped.
 	UnauthorizedBundleTTL time.Duration `yaml:"unauthorizedbundlettl" long:"unauthorizedbundlettl" description:"How long a never-authorized bundle is retained"`
 
+	// RetentionDays bounds how long usage and provider billing events
+	// are kept before the periodic sweep prunes them. Zero keeps them
+	// forever.
+	RetentionDays int `yaml:"retentiondays" long:"retentiondays" description:"Days to retain usage and provider billing events, 0 keeps them forever"`
+
 	// RefreshInterval is how often the price table re-reads the upstream
 	// model list and the BTC-USD rate.
 	RefreshInterval time.Duration `yaml:"refreshinterval" long:"refreshinterval" description:"How often the price table refreshes"`
@@ -193,6 +202,7 @@ func NewConfig() *Config {
 		EstimatedTokens:        DefaultEstimatedTokens,
 		MaxUnauthorizedBundles: DefaultMaxUnauthorizedBundles,
 		RefreshInterval:        DefaultRefreshInterval,
+		RetentionDays:          DefaultRetentionDays,
 		Baseten: BasetenConfig{
 			BaseURL: DefaultBasetenBaseURL,
 		},
@@ -324,6 +334,11 @@ func (c *Config) validate() error {
 	if c.RefreshInterval > 0 && c.RefreshInterval < time.Minute {
 		return fmt.Errorf("refreshinterval must be at least 1m, "+
 			"got %v", c.RefreshInterval)
+	}
+
+	if c.RetentionDays < 0 {
+		return fmt.Errorf("retentiondays must not be negative, got "+
+			"%d", c.RetentionDays)
 	}
 
 	checkRates := func(name string, m *ModelPricing) error {

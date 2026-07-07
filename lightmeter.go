@@ -43,9 +43,21 @@ type Daemon struct {
 func NewDaemon(ctx context.Context, cfg *Config) (*Daemon, error) {
 	logger := slog.Default()
 
-	st, err := store.NewSQLiteStore(
-		cfg.DBPath, cfg.MaxUnauthorizedBundles,
-	)
+	// The eviction age floor matches the janitor's TTL: within it a
+	// paid-but-not-yet-used bundle is immune to count eviction, and
+	// beyond it the janitor reaps unauthorized bundles anyway.
+	minEvictionAge := cfg.UnauthorizedBundleTTL
+	if minEvictionAge <= 0 {
+		minEvictionAge = meterd.DefaultUnauthorizedBundleTTL
+	}
+
+	st, err := store.NewSQLiteStore(store.StoreConfig{
+		Path:            cfg.DBPath,
+		MaxUnauthorized: cfg.MaxUnauthorizedBundles,
+		MinEvictionAge:  minEvictionAge,
+		Retention: time.Duration(cfg.RetentionDays) *
+			24 * time.Hour,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("unable to open store: %w", err)
 	}

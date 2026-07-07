@@ -113,6 +113,28 @@ type reservation struct {
 	at     time.Time
 }
 
+// StoreConfig configures a SQLiteStore.
+type StoreConfig struct {
+	// Path is the sqlite database file to open, created when missing.
+	Path string
+
+	// MaxUnauthorized caps the number of never-authorized (un-paid)
+	// bundles retained at once. A non-positive value disables the cap.
+	MaxUnauthorized int
+
+	// MinEvictionAge is the age below which a never-authorized bundle is
+	// immune to count-based eviction. Payment happens at the proxy, so a
+	// just-paid bundle looks un-paid until its first authorized request;
+	// the floor keeps a mint-spam burst from evicting it in that window.
+	// A non-positive value disables the floor.
+	MinEvictionAge time.Duration
+
+	// Retention bounds how long usage and provider billing events are
+	// kept before the periodic sweep prunes them. The bundles table is
+	// never pruned. A non-positive value keeps events forever.
+	Retention time.Duration
+}
+
 // SQLiteStore keeps bundle balances, the usage ledger and provider billing
 // events in a single sqlite database. In-flight reservations are kept in
 // memory only, mirroring the JSON store: they track live requests and are
@@ -130,15 +152,19 @@ type SQLiteStore struct {
 	mtx      sync.Mutex
 	reserved map[string][]reservation
 
-	maxUnauthorized int
+	cfg StoreConfig
+
+	// lastPrune is when the event retention sweep last ran.
+	lastPrune time.Time
 }
 
 // A compile-time check that SQLiteStore satisfies meterd.Store.
 var _ meterd.Store = (*SQLiteStore)(nil)
 
-// NewSQLiteStore opens (creating when necessary) the database at the given
-// path and applies the schema.
-func NewSQLiteStore(path string, maxUnauthorized int) (*SQLiteStore, error) {
+// NewSQLiteStore opens (creating when necessary) the configured database
+// and applies the schema.
+func NewSQLiteStore(cfg StoreConfig) (*SQLiteStore, error) {
+	path := cfg.Path
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("unable to open database %s: %w",
@@ -185,10 +211,10 @@ func NewSQLiteStore(path string, maxUnauthorized int) (*SQLiteStore, error) {
 	}
 
 	return &SQLiteStore{
-		db:              db,
-		rdb:             rdb,
-		reserved:        make(map[string][]reservation),
-		maxUnauthorized: maxUnauthorized,
+		db:       db,
+		rdb:      rdb,
+		reserved: make(map[string][]reservation),
+		cfg:      cfg,
 	}, nil
 }
 
@@ -296,20 +322,43 @@ func (s *SQLiteStore) Book(tokenID, model string, tokens,
 }
 
 // evictOldestUnauthorizedLocked deletes never-authorized bundles beyond the
-// configured cap, oldest first. The caller must hold the mutex.
+// configured cap, oldest first. Bundles younger than the eviction age floor
+// still count against the cap but are never candidates, so a mint-spam
+// burst cannot push out a just-paid bundle before its first authorized
+// request. The caller must hold the mutex.
 func (s *SQLiteStore) evictOldestUnauthorizedLocked() error {
-	if s.maxUnauthorized <= 0 {
+	if s.cfg.MaxUnauthorized <= 0 {
 		return nil
 	}
 
-	_, err := s.db.Exec(`
+	var total int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM bundles WHERE authorized = 0`,
+	).Scan(&total)
+	if err != nil {
+		return err
+	}
+
+	excess := total - s.cfg.MaxUnauthorized
+	if excess <= 0 {
+		return nil
+	}
+
+	// Everything is evictable without a floor; with one, only bundles
+	// created before the cutoff are.
+	evictBefore := time.Now().Unix() + 1
+	if s.cfg.MinEvictionAge > 0 {
+		evictBefore = time.Now().Add(-s.cfg.MinEvictionAge).Unix()
+	}
+
+	_, err = s.db.Exec(`
 		DELETE FROM bundles WHERE token_id IN (
 			SELECT token_id FROM bundles
-			WHERE authorized = 0
-			ORDER BY created_at DESC
-			LIMIT -1 OFFSET ?
+			WHERE authorized = 0 AND created_at < ?
+			ORDER BY created_at ASC
+			LIMIT ?
 		)`,
-		s.maxUnauthorized,
+		evictBefore, excess,
 	)
 
 	return err
@@ -511,6 +560,27 @@ func (s *SQLiteStore) ExpireStale(ttl time.Duration) int {
 
 	for tokenID := range s.reserved {
 		s.reservedLocked(tokenID)
+	}
+
+	// Piggyback the event retention sweep on the janitor's cadence,
+	// pruning at most once per hour. Bundle balances are never pruned;
+	// only the append-only event tables are bounded.
+	if s.cfg.Retention > 0 && time.Since(s.lastPrune) >= time.Hour {
+		pruneBefore := time.Now().Add(-s.cfg.Retention).Unix()
+		_, err := s.db.Exec(
+			`DELETE FROM usage_events WHERE created_at < ?`,
+			pruneBefore,
+		)
+		if err == nil {
+			_, err = s.db.Exec(
+				`DELETE FROM provider_events
+				 WHERE received_at < ?`,
+				pruneBefore,
+			)
+		}
+		if err == nil {
+			s.lastPrune = time.Now()
+		}
 	}
 
 	cutoff := time.Now().Add(-ttl).Unix()
