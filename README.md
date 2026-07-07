@@ -72,6 +72,15 @@ services:
       metered: true
 ```
 
+## Docs
+
+- [Architecture](docs/architecture.md): the end-to-end system across
+  pi-402, aperture and lightmeter, and the bundle lifecycle.
+- [Pricing](docs/pricing.md): the USD to msat pipeline, refresh semantics
+  and bundle policy.
+- [Operations](docs/operations.md): deployment, the database,
+  reconciliation and failure modes.
+
 ## Status
 
 The buyer-side counterpart is the [pi-402](https://github.com/lightninglabs/pi-402)
