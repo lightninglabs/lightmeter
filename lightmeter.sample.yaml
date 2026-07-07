@@ -1,0 +1,69 @@
+# The address the pricesrpc gRPC interface is served on. Aperture's
+# dynamicprice.grpcaddress points here.
+listenaddr: "127.0.0.1:10020"
+
+# TLS for the gRPC interface. Plaintext when unset, matching aperture's
+# dynamicprice.insecure mode.
+# tlscertpath: "/path/to/tls.cert"
+# tlskeypath: "/path/to/tls.key"
+
+# The sqlite database bundle balances, the usage ledger and provider
+# billing events are stored in.
+dbpath: "/path/to/lightmeter.db"
+
+# The model used to price requests whose model is missing or unknown.
+defaultmodel: "zai-org/GLM-4.7"
+
+# The daemon-wide number of LLM tokens sold per bundle. One L402 payment
+# purchases one bundle. Individual models can override this.
+bundletokens: 1000000
+
+# The per-request token estimate reserved on authorization when the request
+# body carries no max_tokens hint. Bounds concurrent overdraw on a
+# near-empty bundle.
+estimatedtokens: 4096
+
+# How often the price table re-reads the upstream model list and the
+# BTC-USD rate.
+refreshinterval: 15m
+
+# The per-model seller economics: what the upstream provider charges in USD
+# per million tokens. These entries are authoritative and survive upstream
+# refreshes.
+models:
+  "zai-org/GLM-4.7":
+    inputusdpermtok: 0.55
+    outputusdpermtok: 2.15
+    # Optional per-model bundle size override.
+    # bundletokens: 500000
+
+pricing:
+  # The markup applied on top of the upstream USD price, in percent. A
+  # value of 25 sells tokens at 1.25 times the upstream price.
+  marginpercent: 25
+
+  # Prices models discovered from /v1/models that have no explicit entry
+  # in the models map. Omit to make only the models map sellable.
+  defaultusd:
+    inputusdpermtok: 0.50
+    outputusdpermtok: 1.50
+
+  btcusd:
+    # Pin the BTC-USD rate to a fixed value (regtest/dev). When zero or
+    # unset, the Coinbase spot feed is used.
+    staticrate: 0
+
+baseten:
+  # The Baseten API key enables model discovery from /v1/models. Prefer
+  # apikeypath so the key stays out of this file. Discovery is disabled
+  # when neither is set.
+  # apikey: ""
+  apikeypath: "/path/to/baseten.key"
+  baseurl: "https://inference.baseten.co"
+
+webhook:
+  # The billing webhook receiver. Disabled when listenaddr is empty.
+  listenaddr: "127.0.0.1:10021"
+  # The shared HMAC-SHA256 secret webhook payloads are signed with.
+  secret: "replace-me"
+  path: "/webhooks/baseten"
