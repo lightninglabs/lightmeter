@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -22,12 +23,13 @@ type StaticBTCUSD float64
 
 // Rate returns the fixed rate.
 func (s StaticBTCUSD) Rate(context.Context) (float64, error) {
-	if s <= 0 {
-		return 0, fmt.Errorf("static BTC-USD rate must be positive, "+
-			"got %v", float64(s))
+	rate := float64(s)
+	if math.IsNaN(rate) || math.IsInf(rate, 0) || rate <= 0 {
+		return 0, fmt.Errorf("static BTC-USD rate must be a "+
+			"positive finite number, got %v", rate)
 	}
 
-	return float64(s), nil
+	return rate, nil
 }
 
 // CoinbaseSpot reads the BTC-USD spot price from Coinbase's public price
@@ -83,9 +85,11 @@ func (c *CoinbaseSpot) Rate(ctx context.Context) (float64, error) {
 			"%q: %w", payload.Data.Amount, err)
 	}
 
-	if rate <= 0 {
-		return 0, fmt.Errorf("non-positive BTC-USD spot rate %v",
-			rate)
+	// ParseFloat happily accepts "NaN" and "Inf", either of which would
+	// slide through arithmetic comparisons downstream and reprice the
+	// catalog to the floor. Reject anything but a positive finite rate.
+	if math.IsNaN(rate) || math.IsInf(rate, 0) || rate <= 0 {
+		return 0, fmt.Errorf("unusable BTC-USD spot rate %v", rate)
 	}
 
 	return rate, nil

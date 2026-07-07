@@ -3,6 +3,7 @@ package pricing
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -119,4 +120,65 @@ func TestTableRequiresBTCUSD(t *testing.T) {
 
 	_, err := NewTable(context.Background(), cfg)
 	require.Error(t, err)
+}
+
+// TestMsatPerTokenUnusableInputs checks that NaN, infinite, and
+// out-of-range inputs never produce a price. Zero means "no price", and
+// the refresh turns that into an error for positively priced models.
+func TestMsatPerTokenUnusableInputs(t *testing.T) {
+	nan := math.NaN()
+	inf := math.Inf(1)
+
+	require.EqualValues(t, 0, MsatPerToken(2.0, 0, nan))
+	require.EqualValues(t, 0, MsatPerToken(2.0, 0, inf))
+	require.EqualValues(t, 0, MsatPerToken(nan, 0, 100_000))
+	require.EqualValues(t, 0, MsatPerToken(inf, 25, 100_000))
+	require.EqualValues(t, 0, MsatPerToken(2.0, nan, 100_000))
+
+	// A conversion that would exceed the int64 range yields no price
+	// instead of a platform-defined wrap.
+	require.EqualValues(t, 0, MsatPerToken(1e300, 0, 1e-300))
+}
+
+// TestTableRejectsUnusableRates checks that a snapshot with an unusable
+// or overflowing conversion is rejected wholesale.
+func TestTableRejectsUnusableRates(t *testing.T) {
+	// A NaN static rate fails the initial snapshot.
+	cfg := testTableConfig(nil)
+	cfg.BTCUSD = StaticBTCUSD(math.NaN())
+	_, err := NewTable(context.Background(), cfg)
+	require.Error(t, err)
+
+	// An overflowing bundle price fails the snapshot too: a huge USD
+	// rate against a tiny BTC-USD rate pushes the per-token msat rate
+	// times the bundle size beyond the int64 guard ceiling.
+	cfg = testTableConfig(nil)
+	cfg.BTCUSD = StaticBTCUSD(0.000001)
+	cfg.Models["glm"].InputUSDPerMTok = 1_000_000
+	_, err = NewTable(context.Background(), cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "overflows")
+}
+
+// TestTableKeepsVanishedModels checks that a model that disappears from
+// the upstream listing keeps its last-known entry, so outstanding paid
+// bundles booked against it still resolve.
+func TestTableKeepsVanishedModels(t *testing.T) {
+	lister := &fakeLister{models: []string{"glm", "new-model"}}
+	table, err := NewTable(context.Background(), testTableConfig(lister))
+	require.NoError(t, err)
+
+	model, _, err := table.ResolveModel("new-model")
+	require.NoError(t, err)
+	require.Equal(t, "new-model", model)
+
+	// The upstream listing shrinks; the vanished model still resolves
+	// to itself at its last-known rates after the refresh.
+	lister.models = []string{"glm"}
+	require.NoError(t, table.refresh(context.Background()))
+
+	model, rates, err := table.ResolveModel("new-model")
+	require.NoError(t, err)
+	require.Equal(t, "new-model", model)
+	require.EqualValues(t, 2, rates.InputMsatPerToken)
 }

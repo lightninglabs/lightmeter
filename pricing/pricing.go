@@ -168,13 +168,27 @@ func (t *Table) refresher() {
 	}
 }
 
+// maxMsatPrice is the ceiling accepted for the millisatoshi price of a
+// full token bundle, mirroring meterd's own config guard. It protects the
+// bundleTokens times per-token-rate arithmetic against int64 overflow.
+const maxMsatPrice = int64(1) << 60
+
 // refresh recomputes the full rate table snapshot: read the BTC-USD rate,
 // list the upstream models when discovery is enabled, and convert every
-// priced model into msat rates.
+// priced model into msat rates. A snapshot that fails validation (an
+// unusable rate, an overflowing price) is rejected wholesale, keeping the
+// previous snapshot in service.
 func (t *Table) refresh(ctx context.Context) error {
 	btcUSD, err := t.cfg.BTCUSD.Rate(ctx)
 	if err != nil {
 		return fmt.Errorf("unable to read the BTC-USD rate: %w", err)
+	}
+
+	// A NaN or infinite rate would slide through arithmetic comparisons
+	// and reprice the catalog to the 1 msat floor, so it is rejected
+	// here rather than trusted downstream.
+	if math.IsNaN(btcUSD) || math.IsInf(btcUSD, 0) || btcUSD <= 0 {
+		return fmt.Errorf("unusable BTC-USD rate %v", btcUSD)
 	}
 
 	// The configured models are authoritative. Discovered models fill
@@ -213,22 +227,59 @@ func (t *Table) refresh(ctx context.Context) error {
 			bundleTokens = m.BundleTokens
 		}
 
+		inMsat := MsatPerToken(
+			m.InputUSDPerMTok, t.cfg.MarginPercent, btcUSD,
+		)
+		outMsat := MsatPerToken(
+			m.OutputUSDPerMTok, t.cfg.MarginPercent, btcUSD,
+		)
+
+		// A positive USD price that converts to zero msat means the
+		// conversion inputs were unusable (NaN, infinity, or a value
+		// beyond the int64 range). Selling below cost is worse than
+		// serving the previous snapshot, so the refresh fails.
+		if (m.InputUSDPerMTok > 0 && inMsat == 0) ||
+			(m.OutputUSDPerMTok > 0 && outMsat == 0) {
+
+			return fmt.Errorf("model %s: unusable rate "+
+				"conversion at BTC-USD %v", name, btcUSD)
+		}
+
+		// Guard the bundle quote arithmetic downstream in meterd
+		// against int64 overflow, using the same ceiling its own
+		// config validation applies.
+		rateSum := inMsat + outMsat
+		if rateSum < 0 ||
+			(rateSum > 0 && bundleTokens > maxMsatPrice/rateSum) {
+
+			return fmt.Errorf("model %s: bundle price "+
+				"overflows: %d tokens at %d msat per token",
+				name, bundleTokens, rateSum)
+		}
+
 		entries[name] = &modelEntry{
 			rates: &meterd.ModelConfig{
-				InputMsatPerToken: MsatPerToken(
-					m.InputUSDPerMTok,
-					t.cfg.MarginPercent, btcUSD,
-				),
-				OutputMsatPerToken: MsatPerToken(
-					m.OutputUSDPerMTok,
-					t.cfg.MarginPercent, btcUSD,
-				),
+				InputMsatPerToken:  inMsat,
+				OutputMsatPerToken: outMsat,
 			},
 			bundleTokens: bundleTokens,
 		}
 	}
 
+	// Models that vanished from this refresh (delisted upstream, or a
+	// transiently partial listing) carry their previous entry forward.
+	// Clients hold paid bundles booked against those model names, and a
+	// missing entry would strand their balances behind the model
+	// mismatch guard. Config entries are unaffected: they are always in
+	// the new snapshot.
 	t.mtx.Lock()
+	for name, entry := range t.entries {
+		if _, ok := entries[name]; !ok {
+			entries[name] = entry
+			t.log.Warn("Model vanished from refresh, keeping "+
+				"last-known rates", "model", name)
+		}
+	}
 	t.entries = entries
 	t.mtx.Unlock()
 
@@ -283,12 +334,29 @@ func (t *Table) BundleTokens(model string) int64 {
 //	msat = usdPerMTok / 1e6 [USD/tok] / btcUSD [BTC/USD] * 1e8 [sat/BTC]
 //	       * 1e3 [msat/sat] * (1 + margin/100)
 //	     = usdPerMTok * 1e5 * (1 + margin/100) / btcUSD.
+//
+// Unusable inputs (NaN, infinities, non-positive values) and results
+// beyond the int64 range all return 0, which callers must treat as "no
+// price" rather than "free": converting int64(math.Ceil(x)) of an
+// out-of-range float is platform-defined and could otherwise wrap an
+// absurdly high price into a near-free one.
 func MsatPerToken(usdPerMTok, marginPercent, btcUSD float64) int64 {
+	if math.IsNaN(usdPerMTok) || math.IsInf(usdPerMTok, 0) ||
+		math.IsNaN(marginPercent) || math.IsInf(marginPercent, 0) ||
+		math.IsNaN(btcUSD) || math.IsInf(btcUSD, 0) {
+
+		return 0
+	}
+
 	if usdPerMTok <= 0 || btcUSD <= 0 {
 		return 0
 	}
 
 	msat := usdPerMTok * 100_000 * (1 + marginPercent/100) / btcUSD
+
+	if math.IsNaN(msat) || msat >= float64(math.MaxInt64) || msat < 0 {
+		return 0
+	}
 
 	n := int64(math.Ceil(msat))
 	if n < 1 {
