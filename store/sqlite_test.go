@@ -110,6 +110,39 @@ func TestReservations(t *testing.T) {
 	require.EqualValues(t, 60, available)
 }
 
+// TestReservationExpiry checks that a reservation whose usage report
+// never arrives ages out instead of permanently shrinking the bundle's
+// available balance.
+func TestReservationExpiry(t *testing.T) {
+	s := newTestStore(t)
+
+	_, err := s.Book("token", "glm", 1000, 1500)
+	require.NoError(t, err)
+
+	// Reserve most of the bundle.
+	available, _, err := s.Authorize("token", 900)
+	require.NoError(t, err)
+	require.EqualValues(t, 1000, available)
+
+	// A second request sees the shrunken availability.
+	available, _, err = s.Authorize("token", 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 100, available)
+
+	// Backdate the first reservation past the age bound, as if its
+	// usage report was lost. The next authorization sees the full
+	// balance again.
+	s.mtx.Lock()
+	s.reserved["token"][0].at = time.Now().Add(
+		-maxReservationAge - time.Minute,
+	)
+	s.mtx.Unlock()
+
+	available, _, err = s.Authorize("token", 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 1000, available)
+}
+
 // TestPersistence checks that balances survive a store reopen while
 // reservations do not.
 func TestPersistence(t *testing.T) {

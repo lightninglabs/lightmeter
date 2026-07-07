@@ -98,15 +98,37 @@ type ReconRow struct {
 // ReconReport maps a model to its reconciliation row.
 type ReconReport map[string]*ReconRow
 
+// maxReservationAge bounds how long an authorization reservation is held
+// before it expires on its own. The pricesrpc proto does not correlate a
+// usage report with the authorization that preceded it, so the release on
+// debit is approximate; without an age bound, the residue of mismatched
+// estimates accumulates until a paid bundle reads as exhausted. No real
+// inference request outlives this bound.
+const maxReservationAge = 10 * time.Minute
+
+// reservation is one authorization's estimated token cost, held until the
+// matching usage report releases it or it ages out.
+type reservation struct {
+	amount int64
+	at     time.Time
+}
+
 // SQLiteStore keeps bundle balances, the usage ledger and provider billing
 // events in a single sqlite database. In-flight reservations are kept in
 // memory only, mirroring the JSON store: they track live requests and are
 // deliberately dropped on restart.
 type SQLiteStore struct {
+	// db is the writer handle, bounded to a single connection so the
+	// metering path never contends with itself.
 	db *sql.DB
 
+	// rdb is a read-only handle used by the reconciliation report, so
+	// long analytical scans never hold up the metering path. WAL mode
+	// lets readers run concurrently with the writer.
+	rdb *sql.DB
+
 	mtx      sync.Mutex
-	reserved map[string]int64
+	reserved map[string][]reservation
 
 	maxUnauthorized int
 }
@@ -145,16 +167,94 @@ func NewSQLiteStore(path string, maxUnauthorized int) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("unable to apply schema: %w", err)
 	}
 
+	// A second handle serves the reconciliation report's read-only
+	// scans without taking the metering mutex or the writer
+	// connection.
+	rdb, err := sql.Open("sqlite", path)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("unable to open reader handle for "+
+			"%s: %w", path, err)
+	}
+	rdb.SetMaxOpenConns(1)
+	if _, err := rdb.Exec("PRAGMA busy_timeout = 5000;"); err != nil {
+		_ = db.Close()
+		_ = rdb.Close()
+		return nil, fmt.Errorf("unable to configure reader "+
+			"handle: %w", err)
+	}
+
 	return &SQLiteStore{
 		db:              db,
-		reserved:        make(map[string]int64),
+		rdb:             rdb,
+		reserved:        make(map[string][]reservation),
 		maxUnauthorized: maxUnauthorized,
 	}, nil
 }
 
-// Close closes the underlying database.
+// Close closes the underlying database handles.
 func (s *SQLiteStore) Close() error {
-	return s.db.Close()
+	rErr := s.rdb.Close()
+	if err := s.db.Close(); err != nil {
+		return err
+	}
+
+	return rErr
+}
+
+// reservedLocked returns the token's total live reservation, dropping any
+// entries older than maxReservationAge on the way. The caller must hold
+// the mutex.
+func (s *SQLiteStore) reservedLocked(tokenID string) int64 {
+	entries := s.reserved[tokenID]
+	if len(entries) == 0 {
+		return 0
+	}
+
+	cutoff := time.Now().Add(-maxReservationAge)
+
+	var (
+		live  []reservation
+		total int64
+	)
+	for _, r := range entries {
+		if r.at.Before(cutoff) {
+			continue
+		}
+
+		live = append(live, r)
+		total += r.amount
+	}
+
+	if len(live) == 0 {
+		delete(s.reserved, tokenID)
+	} else {
+		s.reserved[tokenID] = live
+	}
+
+	return total
+}
+
+// releaseLocked releases up to the given amount of the token's
+// reservation, oldest entries first. The caller must hold the mutex.
+func (s *SQLiteStore) releaseLocked(tokenID string, amount int64) {
+	entries := s.reserved[tokenID]
+	for len(entries) > 0 && amount > 0 {
+		if entries[0].amount <= amount {
+			amount -= entries[0].amount
+			entries = entries[1:]
+			continue
+		}
+
+		entries[0].amount -= amount
+		amount = 0
+	}
+
+	if len(entries) == 0 {
+		delete(s.reserved, tokenID)
+	} else {
+		s.reserved[tokenID] = entries
+	}
 }
 
 // Book records a fresh bundle for the given token ID. Booking is
@@ -245,7 +345,7 @@ func (s *SQLiteStore) Authorize(tokenID string, estimate int64) (int64, bool,
 	// The available balance already nets out the tokens reserved by
 	// other in-flight requests, so N concurrent requests on a
 	// near-empty bundle cannot all authorize.
-	available := remaining - s.reserved[tokenID]
+	available := remaining - s.reservedLocked(tokenID)
 
 	if !authorized {
 		_, err := s.db.Exec(
@@ -261,7 +361,10 @@ func (s *SQLiteStore) Authorize(tokenID string, estimate int64) (int64, bool,
 	// Reserve the estimate only when the request is going to be
 	// allowed, so a denied request does not tie up balance.
 	if available > 0 && estimate > 0 {
-		s.reserved[tokenID] += estimate
+		s.reserved[tokenID] = append(
+			s.reserved[tokenID],
+			reservation{amount: estimate, at: time.Now()},
+		)
 	}
 
 	return available, true, nil
@@ -300,7 +403,7 @@ func (s *SQLiteStore) getLocked(tokenID string) (meterd.Bundle, error) {
 	}
 
 	b.CreatedAt = time.Unix(createdAt, 0).UTC()
-	b.Reserved = s.reserved[tokenID]
+	b.Reserved = s.reservedLocked(tokenID)
 
 	return b, nil
 }
@@ -308,7 +411,9 @@ func (s *SQLiteStore) getLocked(tokenID string) (meterd.Bundle, error) {
 // Debit subtracts the actual tokens consumed from the token's balance,
 // clamping at zero, releases the given reservation estimate taken at
 // authorization time, and appends the consumption to the durable usage
-// ledger the reconciliation report reads from.
+// ledger the reconciliation report reads from. The balance update and the
+// ledger append commit atomically, so a crash cannot debit money without
+// its ledger row.
 func (s *SQLiteStore) Debit(tokenID string, tokens,
 	releaseEstimate int64) (meterd.Bundle, bool, error) {
 
@@ -317,64 +422,96 @@ func (s *SQLiteStore) Debit(tokenID string, tokens,
 
 	// Release the reservation taken on authorization.
 	if releaseEstimate > 0 {
-		s.reserved[tokenID] -= releaseEstimate
-		if s.reserved[tokenID] <= 0 {
-			delete(s.reserved, tokenID)
-		}
+		s.releaseLocked(tokenID, releaseEstimate)
 	}
 
-	if tokens > 0 {
-		res, err := s.db.Exec(`
-			UPDATE bundles
-			SET remaining_tokens = MAX(0, remaining_tokens - ?)
-			WHERE token_id = ?`,
-			tokens, tokenID,
-		)
-		if err != nil {
-			return meterd.Bundle{}, false, err
-		}
-
-		n, err := res.RowsAffected()
-		if err != nil {
-			return meterd.Bundle{}, false, err
-		}
-		if n == 0 {
+	if tokens <= 0 {
+		b, err := s.getLocked(tokenID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
 			return meterd.Bundle{}, false, nil
+
+		case err != nil:
+			return meterd.Bundle{}, false, err
 		}
+
+		return b, true, nil
 	}
 
-	b, err := s.getLocked(tokenID)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return meterd.Bundle{}, false, nil
-
-	case err != nil:
+	tx, err := s.db.Begin()
+	if err != nil {
 		return meterd.Bundle{}, false, err
 	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.Exec(`
+		UPDATE bundles
+		SET remaining_tokens = MAX(0, remaining_tokens - ?)
+		WHERE token_id = ?`,
+		tokens, tokenID,
+	)
+	if err != nil {
+		return meterd.Bundle{}, false, err
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return meterd.Bundle{}, false, err
+	}
+	if n == 0 {
+		return meterd.Bundle{}, false, nil
+	}
+
+	var (
+		b         meterd.Bundle
+		createdAt int64
+	)
+	err = tx.QueryRow(`
+		SELECT model, price_sats, remaining_tokens, created_at,
+			authorized
+		FROM bundles WHERE token_id = ?`,
+		tokenID,
+	).Scan(
+		&b.Model, &b.PriceSats, &b.RemainingTokens, &createdAt,
+		&b.Authorized,
+	)
+	if err != nil {
+		return meterd.Bundle{}, false, err
+	}
+	b.CreatedAt = time.Unix(createdAt, 0).UTC()
+	b.Reserved = s.reservedLocked(tokenID)
 
 	// Append the consumption to the usage ledger. The ledger is what
 	// the reconciliation report compares against the provider's
 	// billing events.
-	if tokens > 0 {
-		_, err := s.db.Exec(`
-			INSERT INTO usage_events (
-				token_id, model, tokens, created_at
-			) VALUES (?, ?, ?, ?)`,
-			tokenID, b.Model, tokens, time.Now().Unix(),
-		)
-		if err != nil {
-			return b, true, err
-		}
+	_, err = tx.Exec(`
+		INSERT INTO usage_events (
+			token_id, model, tokens, created_at
+		) VALUES (?, ?, ?, ?)`,
+		tokenID, b.Model, tokens, time.Now().Unix(),
+	)
+	if err != nil {
+		return meterd.Bundle{}, false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return meterd.Bundle{}, false, err
 	}
 
 	return b, true, nil
 }
 
 // ExpireStale removes bundles that were never used by an authorized request
-// within the given TTL and returns the number of removed bundles.
+// within the given TTL and returns the number of removed bundles. The
+// periodic janitor drives this, so it doubles as the sweep that ages out
+// stale reservations across all tokens.
 func (s *SQLiteStore) ExpireStale(ttl time.Duration) int {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+
+	for tokenID := range s.reserved {
+		s.reservedLocked(tokenID)
+	}
 
 	cutoff := time.Now().Add(-ttl).Unix()
 
@@ -429,11 +566,9 @@ func (s *SQLiteStore) RecordProviderEvent(ev ProviderEvent) error {
 
 // ReconReport compares, per model, the tokens this daemon debited from
 // client bundles against the tokens the provider billed since the given
-// time.
+// time. It runs on the read-only handle without the metering mutex, so an
+// expensive analytical scan can never stall the payment path.
 func (s *SQLiteStore) ReconReport(since time.Time) (ReconReport, error) {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
 	report := make(ReconReport)
 	row := func(model string) *ReconRow {
 		if r, ok := report[model]; ok {
@@ -446,7 +581,7 @@ func (s *SQLiteStore) ReconReport(since time.Time) (ReconReport, error) {
 		return r
 	}
 
-	metered, err := s.db.Query(`
+	metered, err := s.rdb.Query(`
 		SELECT model, SUM(tokens) FROM usage_events
 		WHERE created_at >= ? GROUP BY model`,
 		since.Unix(),
@@ -474,7 +609,7 @@ func (s *SQLiteStore) ReconReport(since time.Time) (ReconReport, error) {
 	// A provider event without a token split still carries the total,
 	// so the total column is authoritative and falls back to the sum
 	// of the split when zero.
-	billed, err := s.db.Query(`
+	billed, err := s.rdb.Query(`
 		SELECT COALESCE(model, ''),
 			SUM(MAX(total_tokens, input_tokens + output_tokens))
 		FROM provider_events
