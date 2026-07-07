@@ -9,6 +9,7 @@ package webhook
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -55,6 +56,12 @@ type Config struct {
 	// is disabled when nil.
 	Reporter Reporter
 
+	// ReconToken is the bearer token required to read the
+	// reconciliation report. The report endpoint is disabled when
+	// empty: the listener faces the internet for webhook delivery, so
+	// revenue-shaped data is never served unauthenticated.
+	ReconToken string
+
 	// Logger receives ingest diagnostics. A default logger is used
 	// when nil.
 	Logger *slog.Logger
@@ -79,6 +86,16 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("an event sink is required")
 	}
 
+	// An invalid mount path would panic inside ServeMux registration,
+	// so it is validated here where it can fail cleanly.
+	if cfg.Path == "" {
+		cfg.Path = "/webhooks/baseten"
+	}
+	if !strings.HasPrefix(cfg.Path, "/") {
+		return nil, fmt.Errorf("webhook path %q must start with /",
+			cfg.Path)
+	}
+
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -91,7 +108,7 @@ func NewServer(cfg Config) (*Server, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+cfg.Path, s.handleWebhook)
-	if cfg.Reporter != nil {
+	if cfg.Reporter != nil && cfg.ReconToken != "" {
 		mux.HandleFunc("GET /recon", s.handleRecon)
 	}
 
@@ -146,6 +163,15 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ev := parseEvent(body)
+
+	// Events without an upstream identifier synthesize one from the
+	// payload hash, so a captured valid payload cannot be replayed into
+	// N ledger rows: the store dedupes on the event ID.
+	if ev.EventID == "" {
+		sum := sha256.Sum256(body)
+		ev.EventID = "sha256:" + hex.EncodeToString(sum[:])
+	}
+
 	if err := s.cfg.Sink.RecordProviderEvent(ev); err != nil {
 		s.log.Error("Unable to store provider event", "err", err)
 		http.Error(w, "unable to store event",
@@ -163,6 +189,16 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 // handleRecon serves the reconciliation report. The window defaults to the
 // last 24 hours and can be overridden with a ?since=RFC3339 timestamp.
 func (s *Server) handleRecon(w http.ResponseWriter, r *http.Request) {
+	auth := r.Header.Get("Authorization")
+	token, ok := strings.CutPrefix(auth, "Bearer ")
+	if !ok || subtle.ConstantTimeCompare(
+		[]byte(token), []byte(s.cfg.ReconToken),
+	) != 1 {
+
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	since := time.Now().Add(-24 * time.Hour)
 	if raw := r.URL.Query().Get("since"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339, raw)
