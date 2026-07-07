@@ -27,6 +27,10 @@ estimatedtokens: 4096
 # BTC-USD rate.
 refreshinterval: 15m
 
+# Days to retain usage and provider billing events for reconciliation.
+# Zero keeps them forever.
+retentiondays: 90
+
 # The per-model seller economics: what the upstream provider charges in USD
 # per million tokens. These entries are authoritative and survive upstream
 # refreshes.
@@ -39,14 +43,10 @@ models:
 
 pricing:
   # The markup applied on top of the upstream USD price, in percent. A
-  # value of 25 sells tokens at 1.25 times the upstream price.
-  #
-  # NOTE: bundles are priced at the blended (input+output)/2 rate while
-  # usage debits raw token counts, so an output-heavy workload can cost
-  # more than the blend. To be loss-proof against a worst-case all-output
-  # buyer, the margin must exceed (out - in) / (out + in) as a percentage:
-  # for a 0.55/2.15 model that is ~59%.
-  marginpercent: 60
+  # value of 25 sells tokens at 1.25 times the upstream price. Usage
+  # debits are weighted by direction, so this is pure margin regardless
+  # of the buyer's prompt/completion mix.
+  marginpercent: 25
 
   # Prices models discovered from /v1/models that have no explicit entry
   # in the models map. Omit to make only the models map sellable.

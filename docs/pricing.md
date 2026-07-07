@@ -36,9 +36,9 @@ Two rounding rules protect the seller:
 
 These per-token msat rates are exactly what the embedded meterd core prices
 with: a bundle quote is `ceil(bundleTokens * (input + output) / 2 / 1000)`
-sats (the blended rate, assuming an even prompt/completion mix), and usage
-reports debit at the exact per-direction rates when the response's usage
-object splits them.
+sats (the blended rate), and usage reports debit bundle tokens weighted by
+direction when the response's usage object splits them, so the msat value
+drawn down always matches the msat value served.
 
 ## Where each input comes from
 
@@ -64,14 +64,12 @@ only explicitly priced models resolve.
 top of the upstream USD price. 25 means clients pay 1.25 times what Baseten
 charges the seller.
 
-One caution on sizing it: bundles are *priced* at the blended
-(input+output)/2 rate, but usage *debits* raw token counts regardless of
-direction, and the buyer chooses the mix. A worst-case all-output buyer
-costs the seller the output rate while having paid the blend. The margin
-that makes even that buyer non-loss-making is `(out - in) / (out + in)`:
-about 59% for a $0.55/$2.15 model. Set the margin above that bound, or
-accept that output-heavy workloads may run below cost until direction
-weighted debiting lands upstream.
+The margin is pure margin: bundles are *priced* at the blended
+(input+output)/2 rate, and usage reports *debit* by direction, charging a
+completion token as `outRate/blend` bundle tokens (rounding up). The msat
+value drawn from a bundle therefore always matches the msat value served,
+whatever prompt/completion mix the buyer chooses, so the margin never has
+to double as insurance against an output-heavy workload.
 
 ## Refresh semantics
 
@@ -91,9 +89,12 @@ Failure is asymmetric by design:
   sharp BTC move are a real (bounded) exposure.
 
 Model *removal* is deliberately conservative: a model that disappears from
-`/v1/models` but remains in the config keeps pricing, since config entries
-are authoritative. Outstanding bundles for a model that stops resolving
-deny with the default model's quote.
+`/v1/models` keeps its last-known entry (and a config entry always
+survives), so outstanding paid bundles booked against it keep resolving.
+Requests naming a model the table has *never* priced fail closed: they are
+neither quoted nor served, since an unpriced model riding another model's
+bundle is exactly the arbitrage the mismatch guard exists to stop. Only a
+request naming no model at all falls back to `defaultmodel`.
 
 ## Bundle policy
 
