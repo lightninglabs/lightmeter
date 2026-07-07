@@ -2,6 +2,8 @@ package lightmeter
 
 import (
 	"fmt"
+	"math"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -39,6 +41,14 @@ const (
 	// DefaultWebhookPath is the path the billing webhook receiver is
 	// mounted on.
 	DefaultWebhookPath = "/webhooks/baseten"
+
+	// maxMarginPercent is the sanity ceiling on the configured margin.
+	maxMarginPercent = 10_000.0
+
+	// maxUSDPerMTok is the sanity ceiling on a configured USD per
+	// million token rate. It keeps a fat-fingered price from pushing
+	// the msat conversion toward the int64 range.
+	maxUSDPerMTok = 1_000_000.0
 )
 
 // ModelPricing holds the seller-side economics of a single model: what the
@@ -109,6 +119,11 @@ type WebhookConfig struct {
 
 	// Path is the URL path the receiver is mounted on.
 	Path string `yaml:"path"`
+
+	// ReconToken is the bearer token required to read the
+	// reconciliation report. The report endpoint is disabled when
+	// empty.
+	ReconToken string `yaml:"recontoken"`
 }
 
 // Config holds the daemon configuration. Values are read from an optional
@@ -268,14 +283,47 @@ func (c *Config) validate() error {
 			"together")
 	}
 
-	if c.Pricing.MarginPercent < 0 {
-		return fmt.Errorf("marginpercent must not be negative, got "+
-			"%v", c.Pricing.MarginPercent)
+	// The gRPC interface carries unauthenticated money-affecting calls
+	// (ReportUsage debits balances), so serving it in plaintext is only
+	// acceptable on loopback where aperture is co-located.
+	if c.TLSCertPath == "" && !isLoopbackAddr(c.ListenAddr) {
+		return fmt.Errorf("listenaddr %s is not loopback: plaintext "+
+			"gRPC exposes unauthenticated metering calls, set "+
+			"tlscertpath/tlskeypath or bind to 127.0.0.1",
+			c.ListenAddr)
 	}
 
+	finite := func(name string, v float64) error {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%s must be a finite number, got "+
+				"%v", name, v)
+		}
+
+		return nil
+	}
+
+	if err := finite("marginpercent", c.Pricing.MarginPercent); err != nil {
+		return err
+	}
+	if c.Pricing.MarginPercent < 0 ||
+		c.Pricing.MarginPercent > maxMarginPercent {
+
+		return fmt.Errorf("marginpercent must be between 0 and %v, "+
+			"got %v", maxMarginPercent, c.Pricing.MarginPercent)
+	}
+
+	err := finite("btcusd staticrate", c.Pricing.BTCUSD.StaticRate)
+	if err != nil {
+		return err
+	}
 	if c.Pricing.BTCUSD.StaticRate < 0 {
 		return fmt.Errorf("btcusd staticrate must not be negative, "+
 			"got %v", c.Pricing.BTCUSD.StaticRate)
+	}
+
+	if c.RefreshInterval > 0 && c.RefreshInterval < time.Minute {
+		return fmt.Errorf("refreshinterval must be at least 1m, "+
+			"got %v", c.RefreshInterval)
 	}
 
 	checkRates := func(name string, m *ModelPricing) error {
@@ -283,9 +331,24 @@ func (c *Config) validate() error {
 			return fmt.Errorf("model %s has no pricing "+
 				"configured", name)
 		}
+		err := finite(name+" inputusdpermtok", m.InputUSDPerMTok)
+		if err != nil {
+			return err
+		}
+		err = finite(name+" outputusdpermtok", m.OutputUSDPerMTok)
+		if err != nil {
+			return err
+		}
 		if m.InputUSDPerMTok < 0 || m.OutputUSDPerMTok < 0 {
 			return fmt.Errorf("model %s has negative USD rates",
 				name)
+		}
+		if m.InputUSDPerMTok > maxUSDPerMTok ||
+			m.OutputUSDPerMTok > maxUSDPerMTok {
+
+			return fmt.Errorf("model %s has a USD rate above "+
+				"the %v per MTok sanity ceiling", name,
+				maxUSDPerMTok)
 		}
 		if m.BundleTokens < 0 {
 			return fmt.Errorf("model %s has a negative bundle "+
@@ -308,10 +371,13 @@ func (c *Config) validate() error {
 		}
 	}
 
-	if c.DefaultModel != "" {
+	// The default model must be priceable: either explicitly in the
+	// models map, or via the default USD rates once discovery finds it.
+	if c.DefaultModel != "" && c.Pricing.DefaultUSD == nil {
 		if _, ok := c.Models[c.DefaultModel]; !ok {
 			return fmt.Errorf("defaultmodel %s is not present in "+
-				"the models map", c.DefaultModel)
+				"the models map and no pricing.defaultusd "+
+				"is set", c.DefaultModel)
 		}
 	}
 
@@ -320,10 +386,33 @@ func (c *Config) validate() error {
 			"or pricing.defaultusd")
 	}
 
-	if c.Webhook.ListenAddr != "" && c.Webhook.Secret == "" {
-		return fmt.Errorf("webhook.secret must be set when the " +
-			"webhook listener is enabled")
+	if c.Webhook.ListenAddr != "" {
+		if c.Webhook.Secret == "" {
+			return fmt.Errorf("webhook.secret must be set when " +
+				"the webhook listener is enabled")
+		}
+		if !strings.HasPrefix(c.Webhook.Path, "/") {
+			return fmt.Errorf("webhook.path %q must start "+
+				"with /", c.Webhook.Path)
+		}
 	}
 
 	return nil
+}
+
+// isLoopbackAddr reports whether the listen address binds a loopback
+// interface.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+
+	if host == "localhost" {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+
+	return ip != nil && ip.IsLoopback()
 }

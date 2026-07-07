@@ -139,6 +139,7 @@ func NewDaemon(ctx context.Context, cfg *Config) (*Daemon, error) {
 			ListenAddr: cfg.Webhook.ListenAddr,
 			Secret:     cfg.Webhook.Secret,
 			Path:       cfg.Webhook.Path,
+			ReconToken: cfg.Webhook.ReconToken,
 			Sink:       st,
 			Reporter:   st,
 			Logger:     logger,
