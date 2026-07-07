@@ -289,8 +289,12 @@ func (t *Table) refresh(ctx context.Context) error {
 	return nil
 }
 
-// ResolveModel maps a possibly empty or unknown model identifier to a
-// priced model and its current rates, falling back to the default model.
+// ResolveModel maps a model identifier to a priced model and its current
+// rates. Only a request naming no model falls back to the default model; a
+// non-empty identifier absent from the table fails closed, per the
+// meterd.RateSource contract: the server's model mismatch guard relies on
+// unknown models failing resolution, otherwise an unpriced upstream model
+// could ride a cheap bundle through the proxy.
 func (t *Table) ResolveModel(model string) (string, *meterd.ModelConfig,
 	error) {
 
@@ -301,6 +305,8 @@ func (t *Table) ResolveModel(model string) (string, *meterd.ModelConfig,
 		if entry, ok := t.entries[model]; ok {
 			return model, entry.rates, nil
 		}
+
+		return "", nil, fmt.Errorf("unknown model %q", model)
 	}
 
 	if t.cfg.DefaultModel != "" {
@@ -309,8 +315,8 @@ func (t *Table) ResolveModel(model string) (string, *meterd.ModelConfig,
 		}
 	}
 
-	return "", nil, fmt.Errorf("unknown model %q and no default model "+
-		"configured", model)
+	return "", nil, fmt.Errorf("no model named in the request and no " +
+		"default model configured")
 }
 
 // BundleTokens returns the bundle size sold for the given model, falling

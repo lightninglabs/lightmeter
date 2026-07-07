@@ -84,8 +84,12 @@ func TestTableResolveAndBundles(t *testing.T) {
 	require.Equal(t, "new-model", model)
 	require.EqualValues(t, 2, rates.InputMsatPerToken)
 
-	// An unknown model falls back to the default model.
-	model, _, err = table.ResolveModel("bogus")
+	// An unknown model fails closed, per the RateSource contract, while
+	// a request naming no model falls back to the default.
+	_, _, err = table.ResolveModel("bogus")
+	require.ErrorContains(t, err, "unknown model")
+
+	model, _, err = table.ResolveModel("")
 	require.NoError(t, err)
 	require.Equal(t, "glm", model)
 
@@ -105,11 +109,10 @@ func TestTableDiscoveryFailure(t *testing.T) {
 	_, _, err = table.ResolveModel("glm")
 	require.NoError(t, err)
 
-	// The discovered-only model is absent, so it resolves to the
-	// default model rather than itself.
-	model, _, err := table.ResolveModel("new-model")
-	require.NoError(t, err)
-	require.Equal(t, "glm", model)
+	// The discovered-only model is absent, so it fails closed rather
+	// than riding the default model's rates.
+	_, _, err = table.ResolveModel("new-model")
+	require.ErrorContains(t, err, "unknown model")
 }
 
 // TestTableRequiresBTCUSD checks that a table cannot be built without an
