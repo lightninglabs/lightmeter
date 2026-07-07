@@ -51,8 +51,11 @@ service headers; lightmeter needs a key only when model discovery is
 enabled (`baseten.apikeypath`).
 
 Keep both listeners on localhost or a private network. The gRPC interface
-trusts its caller (aperture) completely, and the webhook listener, when
-enabled, is the only piece that should ever face the internet.
+trusts its caller (aperture) completely: `ReportUsage` debits balances, so
+the daemon refuses to start with a plaintext gRPC listener on anything but
+loopback (set `tlscertpath`/`tlskeypath` to bind wider). The webhook
+listener, when enabled, is the only piece that should ever face the
+internet.
 
 For the buyer side of a full regtest rehearsal (funded wallet, Pi with the
 pi-402 extension, this stack fronting a fake model), see pi-402's
@@ -92,18 +95,24 @@ webhook:
   listenaddr: "127.0.0.1:10021"
   secret: "<shared-hmac-secret>"
   path: "/webhooks/baseten"
+  recontoken: "<admin-bearer-token>"
 ```
 
 Point Baseten's billing webhooks at it (through your TLS-terminating
 ingress). Payloads are verified with HMAC-SHA256 over the raw body
 (`X-Baseten-Signature`, `v1=<hex>` or bare hex), stored verbatim, and
-parsed tolerantly for model and token counts. Events carrying an ID are
-deduped on redelivery.
+parsed tolerantly for model and token counts. Every event dedupes on
+redelivery: events carrying an upstream ID dedupe on it, and events
+without one get a content-hash ID, so a captured payload cannot be
+replayed into extra ledger rows.
 
-Then compare the books:
+Then compare the books. The report requires the `recontoken` bearer token
+(and is disabled entirely when no token is configured), since token
+volumes are revenue-shaped data on a listener that may face the internet:
 
 ```
-$ curl -s 'localhost:10021/recon?since=2026-07-01T00:00:00Z' | jq
+$ curl -s -H 'Authorization: Bearer <admin-bearer-token>' \
+    'localhost:10021/recon?since=2026-07-01T00:00:00Z' | jq
 {
   "since": "2026-07-01T00:00:00Z",
   "models": {

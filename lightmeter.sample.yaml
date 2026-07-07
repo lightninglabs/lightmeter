@@ -40,7 +40,13 @@ models:
 pricing:
   # The markup applied on top of the upstream USD price, in percent. A
   # value of 25 sells tokens at 1.25 times the upstream price.
-  marginpercent: 25
+  #
+  # NOTE: bundles are priced at the blended (input+output)/2 rate while
+  # usage debits raw token counts, so an output-heavy workload can cost
+  # more than the blend. To be loss-proof against a worst-case all-output
+  # buyer, the margin must exceed (out - in) / (out + in) as a percentage:
+  # for a 0.55/2.15 model that is ~59%.
+  marginpercent: 60
 
   # Prices models discovered from /v1/models that have no explicit entry
   # in the models map. Omit to make only the models map sellable.
@@ -67,3 +73,7 @@ webhook:
   # The shared HMAC-SHA256 secret webhook payloads are signed with.
   secret: "replace-me"
   path: "/webhooks/baseten"
+  # Bearer token required to read GET /recon. The report endpoint is
+  # disabled entirely when unset, since the webhook listener may face
+  # the internet.
+  recontoken: "replace-me-too"

@@ -11,7 +11,7 @@ replace github.com/lightninglabs/lndclient => github.com/ellemouton/lndclient v0
 require (
 	github.com/goccy/go-yaml v1.15.23
 	github.com/jessevdk/go-flags v1.6.1
-	github.com/lightninglabs/aperture v0.5.1-0.20260707012546-da3b97322d08
+	github.com/lightninglabs/aperture v0.5.1-0.20260707015324-75cc23a4e040
 	github.com/stretchr/testify v1.11.1
 	modernc.org/sqlite v1.29.10
 )

@@ -64,6 +64,15 @@ only explicitly priced models resolve.
 top of the upstream USD price. 25 means clients pay 1.25 times what Baseten
 charges the seller.
 
+One caution on sizing it: bundles are *priced* at the blended
+(input+output)/2 rate, but usage *debits* raw token counts regardless of
+direction, and the buyer chooses the mix. A worst-case all-output buyer
+costs the seller the output rate while having paid the blend. The margin
+that makes even that buyer non-loss-making is `(out - in) / (out + in)`:
+about 59% for a $0.55/$2.15 model. Set the margin above that bound, or
+accept that output-heavy workloads may run below cost until direction
+weighted debiting lands upstream.
+
 ## Refresh semantics
 
 The table recomputes as one atomic snapshot every `refreshinterval`
