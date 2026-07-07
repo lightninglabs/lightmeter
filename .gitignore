@@ -1,0 +1,5 @@
+lightmeterd
+*.db
+*.db-shm
+*.db-wal
+lightmeter.yaml
