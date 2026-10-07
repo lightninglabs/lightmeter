@@ -33,11 +33,11 @@ exposure.
 ## Relationships
 
 - **Embeds**: `github.com/lightninglabs/aperture/meterd` (metering
-  mechanics: booking, reservation, draw-down), pinned in go.mod to the
-  `inference-pricing` branch of
-  [aperture#247](https://github.com/lightninglabs/aperture/pull/247).
+  mechanics: booking, reservation, draw-down, and MPP session
+  quote/settle), pinned in go.mod to a pseudo-version of aperture master.
 - **Serves**: an aperture proxy over `pricesrpc` (GetPrice,
-  ChallengeMinted, AuthorizeRequest, ReportUsage).
+  ChallengeMinted, AuthorizeRequest, ReportUsage, QuoteSession,
+  SettleSession).
 - **Buys from**: [Baseten Model APIs](https://docs.baseten.co/inference/model-apis/overview)
   (model discovery, billing webhooks). The proxy holds the actual API key;
   this daemon only needs one for discovery.
