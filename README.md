@@ -106,7 +106,7 @@ charge the same for the same work.
 
 ## Getting started
 
-You need Go 1.25 or later. `grpcurl` is handy for poking at the daemon but not
+You need Go 1.26.1 or later. `grpcurl` is handy for poking at the daemon but not
 required.
 
 **1. Build.**
