@@ -1,4 +1,4 @@
-lightmeterd
+/lightmeterd
 *.db
 *.db-shm
 *.db-wal
