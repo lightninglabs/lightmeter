@@ -253,6 +253,9 @@ blended rate times the request's `max_tokens`.
 
 - [Architecture](docs/architecture.md): the whole system across pi-402,
   aperture and lightmeter, and the bundle lifecycle in detail.
+- [Code architecture](docs/lightmeter-architecture.md): component map,
+  the pricesrpc surface, the bundle lifecycle, the store schema and
+  goroutine ownership.
 - [Pricing](docs/pricing.md): the USD to msat pipeline, refresh behavior and
   bundle sizing.
 - [Operations](docs/operations.md): deployment, the database, reconciliation
