@@ -2,10 +2,10 @@
 
 This document maps the code of the lightmeter daemon: which type owns which
 state, which goroutine touches it, and what happens message by message between
-an aperture `pricesrpc` call and a durable row in sqlite. It describes commit
-`9e45710`, which pins `github.com/lightninglabs/aperture` at
-`v0.5.1-0.20261007011628-432fd60139b6`. Statements about `meterd` refer to that
-pin. For the system-level story across pi-402, aperture and lightmeter, read
+an aperture `pricesrpc` call and a durable row in sqlite. It was written against
+commit `9e45710` and now covers `github.com/lightninglabs/aperture` v0.6.0.
+The `meterd` and `pricesrpc` sources are identical between the commit the
+statements were read from (`432fd60139b6`) and v0.6.0. For the system-level story across pi-402, aperture and lightmeter, read
 [`architecture.md`](architecture.md); for the price formula and policy knobs,
 [`pricing.md`](pricing.md); for deployment, [`operations.md`](operations.md).
 
@@ -515,7 +515,8 @@ Rules that the table does not show:
 ## Known gaps
 
 - The `meterd` behavior described comes from reading aperture commit
-  `432fd60139b6`, not from running it. Where the dependency moves, the RPC
+  `432fd60139b6`, not from running it. `meterd` and `pricesrpc` did not change
+  between that commit and v0.6.0. Where the dependency moves again, the RPC
   tables and the `AuthorizeRequest` diagram need a re-check.
 - The `QuoteSession` and `SettleSession` RPCs are named but not mapped.
 - The Baseten webhook payload shape is not documented in this repository.
