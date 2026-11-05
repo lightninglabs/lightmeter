@@ -65,6 +65,8 @@ exposure.
 
 - [`docs/architecture.md`](docs/architecture.md) — the end-to-end system
   and the bundle lifecycle.
+- [`docs/lightmeter-architecture.md`](docs/lightmeter-architecture.md) — code
+  map: components, pricesrpc surface, store schema, goroutine ownership.
 - [`docs/pricing.md`](docs/pricing.md) — the USD to msat pipeline and the
   bundle policy.
 - [`docs/operations.md`](docs/operations.md) — config, aperture wiring,
