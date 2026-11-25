@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"math/big"
 	"sync"
 	"time"
 
@@ -24,9 +25,49 @@ type ModelUSD struct {
 	// tokens.
 	OutputUSDPerMTok float64
 
+	// CachedInputUSDPerMTok is the upstream USD price per million cached
+	// input tokens; zero means no cache discount.
+	CachedInputUSDPerMTok float64
+
 	// BundleTokens overrides the table-wide bundle size for this model
 	// when positive.
 	BundleTokens int64
+
+	// BundleSats, when positive, sizes the bundle at each refresh so that
+	// it quotes exactly this many satoshis. It takes precedence over
+	// BundleTokens.
+	BundleSats int64
+}
+
+// cachedPermille is the cached-input price in thousandths of the input
+// price, rounded up so the discount never sells below the upstream ratio.
+// Zero means no discount.
+func cachedPermille(m *ModelUSD) int64 {
+	if m.CachedInputUSDPerMTok <= 0 || m.InputUSDPerMTok <= 0 {
+		return 0
+	}
+	p := int64(math.Ceil(m.CachedInputUSDPerMTok / m.InputUSDPerMTok * 1000))
+
+	return min(max(p, 1), 1000)
+}
+
+// bundleTokensForSats returns the largest bundle that meterd quotes at no
+// more than bundleSats, given per-thousand-token rates. meterd prices a
+// bundle at ceil(tokens * (in + out) / 2,000,000) sats, so the result
+// quotes exactly bundleSats whenever the blended rate is below 2,000,000
+// msat per thousand tokens.
+func bundleTokensForSats(bundleSats, inPerK, outPerK int64) int64 {
+	rateSum := inPerK + outPerK
+	if bundleSats <= 0 || rateSum <= 0 {
+		return 0
+	}
+	tokens := new(big.Int).Mul(big.NewInt(bundleSats), big.NewInt(2_000_000))
+	tokens.Quo(tokens, big.NewInt(rateSum))
+	if !tokens.IsInt64() {
+		return math.MaxInt64
+	}
+
+	return max(tokens.Int64(), 1)
 }
 
 // TableConfig configures a Table.
@@ -234,6 +275,21 @@ func (t *Table) refresh(ctx context.Context) error {
 			m.OutputUSDPerMTok, t.cfg.MarginPercent, btcUSD,
 		)
 
+		// Exact rates in msat per thousand tokens: meterd prefers them
+		// over the whole-msat per-token rates, so cheap models are no
+		// longer rounded up to 1 msat per token.
+		inPerK := MsatPerThousandTokens(
+			m.InputUSDPerMTok, t.cfg.MarginPercent, btcUSD,
+		)
+		outPerK := MsatPerThousandTokens(
+			m.OutputUSDPerMTok, t.cfg.MarginPercent, btcUSD,
+		)
+		if m.BundleSats > 0 {
+			bundleTokens = bundleTokensForSats(
+				m.BundleSats, inPerK, outPerK,
+			)
+		}
+
 		// A positive USD price that converts to zero msat means the
 		// conversion inputs were unusable (NaN, infinity, or a value
 		// beyond the int64 range). Selling below cost is worse than
@@ -256,11 +312,18 @@ func (t *Table) refresh(ctx context.Context) error {
 				"overflows: %d tokens at %d msat per token",
 				name, bundleTokens, rateSum)
 		}
+		if bundleTokens <= 0 {
+			return fmt.Errorf("model %s: bundle size resolves to "+
+				"zero tokens", name)
+		}
 
 		entries[name] = &modelEntry{
 			rates: &meterd.ModelConfig{
-				InputMsatPerToken:  inMsat,
-				OutputMsatPerToken: outMsat,
+				InputMsatPerToken:           inMsat,
+				OutputMsatPerToken:          outMsat,
+				InputMsatPerThousandTokens:  inPerK,
+				OutputMsatPerThousandTokens: outPerK,
+				CachedInputPermille:         cachedPermille(m),
 			},
 			bundleTokens: bundleTokens,
 		}
@@ -330,6 +393,35 @@ func (t *Table) BundleTokens(model string) int64 {
 	}
 
 	return t.cfg.BundleTokens
+}
+
+// MsatPerThousandTokens converts an upstream USD-per-million-token price
+// into an exact millisatoshi price per thousand tokens, with the margin
+// applied, rounded up (at least 1 for any positive price). meterd prefers
+// these rates, so models cheaper than 1 msat per token keep their real price:
+//
+//	msat/ktok = usdPerMTok * 1e8 * (1 + margin/100) / btcUSD.
+//
+// Unusable inputs and out-of-range results return 0, as for MsatPerToken.
+func MsatPerThousandTokens(usdPerMTok, marginPercent, btcUSD float64) int64 {
+	if math.IsNaN(usdPerMTok) || math.IsInf(usdPerMTok, 0) ||
+		math.IsNaN(marginPercent) || math.IsInf(marginPercent, 0) ||
+		math.IsNaN(btcUSD) || math.IsInf(btcUSD, 0) {
+
+		return 0
+	}
+	if usdPerMTok <= 0 || btcUSD <= 0 {
+		return 0
+	}
+
+	// usd per million tokens -> msat per thousand tokens:
+	// usd/1e6 per token * 1e11/btcUSD msat per usd * 1000 tokens.
+	msat := usdPerMTok * 100_000_000 * (1 + marginPercent/100) / btcUSD
+	if math.IsNaN(msat) || msat >= float64(math.MaxInt64) || msat < 0 {
+		return 0
+	}
+
+	return max(int64(math.Ceil(msat)), 1)
 }
 
 // MsatPerToken converts an upstream USD-per-million-token price into a

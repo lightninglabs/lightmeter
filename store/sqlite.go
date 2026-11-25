@@ -159,7 +159,10 @@ type SQLiteStore struct {
 }
 
 // A compile-time check that SQLiteStore satisfies meterd.Store.
-var _ meterd.Store = (*SQLiteStore)(nil)
+var (
+	_ meterd.Store              = (*SQLiteStore)(nil)
+	_ meterd.ReservationExpirer = (*SQLiteStore)(nil)
+)
 
 // NewSQLiteStore opens (creating when necessary) the configured database
 // and applies the schema.
@@ -368,8 +371,8 @@ func (s *SQLiteStore) evictOldestUnauthorizedLocked() error {
 // to be allowed, reserves the given estimated per-request cost against its
 // balance to bound concurrent overdraw. It returns the tokens available
 // after existing reservations and whether the token is known.
-func (s *SQLiteStore) Authorize(tokenID string, estimate int64) (int64, bool,
-	error) {
+func (s *SQLiteStore) Authorize(tokenID string,
+	estimate int64) (meterd.Authorization, bool, error) {
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -385,16 +388,11 @@ func (s *SQLiteStore) Authorize(tokenID string, estimate int64) (int64, bool,
 	).Scan(&remaining, &authorized)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return 0, false, nil
+		return meterd.Authorization{}, false, nil
 
 	case err != nil:
-		return 0, false, err
+		return meterd.Authorization{}, false, err
 	}
-
-	// The available balance already nets out the tokens reserved by
-	// other in-flight requests, so N concurrent requests on a
-	// near-empty bundle cannot all authorize.
-	available := remaining - s.reservedLocked(tokenID)
 
 	if !authorized {
 		_, err := s.db.Exec(
@@ -403,20 +401,35 @@ func (s *SQLiteStore) Authorize(tokenID string, estimate int64) (int64, bool,
 			tokenID,
 		)
 		if err != nil {
-			return 0, false, err
+			return meterd.Authorization{}, false, err
 		}
 	}
 
-	// Reserve the estimate only when the request is going to be
-	// allowed, so a denied request does not tie up balance.
-	if available > 0 && estimate > 0 {
+	// The available balance nets out the tokens reserved by other
+	// in-flight requests, so N concurrent requests on a near-empty bundle
+	// cannot all be admitted. meterd.AdmitReservation decides admission,
+	// and the estimate is reserved only for an admitted request.
+	reserved := s.reservedLocked(tokenID)
+	auth := meterd.Authorization{
+		Remaining: remaining,
+		Available: remaining - reserved,
+		Admitted:  meterd.AdmitReservation(remaining, reserved, estimate),
+	}
+	if auth.Admitted && estimate > 0 {
 		s.reserved[tokenID] = append(
 			s.reserved[tokenID],
 			reservation{amount: estimate, at: time.Now()},
 		)
 	}
 
-	return available, true, nil
+	return auth, true, nil
+}
+
+// ReservationsExpire reports that reservations whose usage report never
+// arrives are dropped after maxReservationAge, so meterd may tell a buyer
+// whose funded bundle is fully reserved to retry later.
+func (s *SQLiteStore) ReservationsExpire() bool {
+	return true
 }
 
 // Get returns a copy of the token's bundle.

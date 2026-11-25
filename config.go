@@ -66,9 +66,22 @@ type ModelPricing struct {
 	// (completion) tokens.
 	OutputUSDPerMTok float64 `yaml:"outputusdpermtok"`
 
+	// CachedInputUSDPerMTok is the upstream USD price per million input
+	// tokens served from the prompt cache. When set, cached prompt tokens
+	// are debited at this fraction of the input price; zero bills them as
+	// fresh input.
+	CachedInputUSDPerMTok float64 `yaml:"cachedinputusdpermtok"`
+
 	// BundleTokens overrides the daemon-wide bundle size for this model
 	// when positive.
 	BundleTokens int64 `yaml:"bundletokens"`
+
+	// BundleSats, when positive, fixes the bundle price in satoshis instead
+	// of its size: each rate refresh sizes the bundle so it quotes exactly
+	// this many sats. Useful when the receiving wallet has a minimum invoice
+	// amount, or to keep a bundle under a buyer's per-payment cap. Takes
+	// precedence over bundletokens.
+	BundleSats int64 `yaml:"bundlesats"`
 }
 
 // BTCUSDConfig configures how the daemon learns the BTC-USD rate used to
@@ -353,6 +366,21 @@ func (c *Config) validate() error {
 		err = finite(name+" outputusdpermtok", m.OutputUSDPerMTok)
 		if err != nil {
 			return err
+		}
+		err = finite(name+" cachedinputusdpermtok", m.CachedInputUSDPerMTok)
+		if err != nil {
+			return err
+		}
+		if m.CachedInputUSDPerMTok < 0 ||
+			(m.InputUSDPerMTok > 0 &&
+				m.CachedInputUSDPerMTok > m.InputUSDPerMTok) {
+
+			return fmt.Errorf("model %s: cachedinputusdpermtok must be "+
+				"between 0 and inputusdpermtok", name)
+		}
+		if m.BundleSats < 0 {
+			return fmt.Errorf("model %s: bundlesats must not be "+
+				"negative", name)
 		}
 		if m.InputUSDPerMTok < 0 || m.OutputUSDPerMTok < 0 {
 			return fmt.Errorf("model %s has negative USD rates",
