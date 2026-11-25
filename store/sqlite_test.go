@@ -51,10 +51,10 @@ func TestBookAuthorizeDebit(t *testing.T) {
 	require.False(t, b.Authorized)
 
 	// Authorization reports the balance and marks the bundle used.
-	remaining, found, err := s.Authorize("token1", 0)
+	auth, found, err := s.Authorize("token1", 0)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.EqualValues(t, 1000, remaining)
+	require.EqualValues(t, 1000, auth.Available)
 
 	b, ok = s.Get("token1")
 	require.True(t, ok)
@@ -71,10 +71,10 @@ func TestBookAuthorizeDebit(t *testing.T) {
 	require.True(t, found)
 	require.EqualValues(t, 0, after.RemainingTokens)
 
-	remaining, found, err = s.Authorize("token1", 0)
+	auth, found, err = s.Authorize("token1", 0)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.EqualValues(t, 0, remaining)
+	require.EqualValues(t, 0, auth.Available)
 }
 
 // TestReservations checks that authorization reservations bound concurrent
@@ -87,17 +87,17 @@ func TestReservations(t *testing.T) {
 
 	// The first request sees the full balance and reserves its
 	// estimate.
-	available, found, err := s.Authorize("token", 100)
+	auth, found, err := s.Authorize("token", 100)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.EqualValues(t, 100, available)
+	require.EqualValues(t, 100, auth.Available)
 
 	// A concurrent second request sees the balance net of the first
 	// reservation.
-	available, found, err = s.Authorize("token", 100)
+	auth, found, err = s.Authorize("token", 100)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.EqualValues(t, 0, available)
+	require.EqualValues(t, 0, auth.Available)
 
 	// The report releases the reservation and debits actual usage.
 	after, found, err := s.Debit("token", 40, 100)
@@ -105,9 +105,9 @@ func TestReservations(t *testing.T) {
 	require.True(t, found)
 	require.EqualValues(t, 60, after.RemainingTokens)
 
-	available, _, err = s.Authorize("token", 100)
+	auth, _, err = s.Authorize("token", 100)
 	require.NoError(t, err)
-	require.EqualValues(t, 60, available)
+	require.EqualValues(t, 60, auth.Available)
 }
 
 // TestReservationExpiry checks that a reservation whose usage report
@@ -120,14 +120,14 @@ func TestReservationExpiry(t *testing.T) {
 	require.NoError(t, err)
 
 	// Reserve most of the bundle.
-	available, _, err := s.Authorize("token", 900)
+	auth, _, err := s.Authorize("token", 900)
 	require.NoError(t, err)
-	require.EqualValues(t, 1000, available)
+	require.EqualValues(t, 1000, auth.Available)
 
 	// A second request sees the shrunken availability.
-	available, _, err = s.Authorize("token", 0)
+	auth, _, err = s.Authorize("token", 0)
 	require.NoError(t, err)
-	require.EqualValues(t, 100, available)
+	require.EqualValues(t, 100, auth.Available)
 
 	// Backdate the first reservation past the age bound, as if its
 	// usage report was lost. The next authorization sees the full
@@ -138,9 +138,9 @@ func TestReservationExpiry(t *testing.T) {
 	)
 	s.mtx.Unlock()
 
-	available, _, err = s.Authorize("token", 0)
+	auth, _, err = s.Authorize("token", 0)
 	require.NoError(t, err)
-	require.EqualValues(t, 1000, available)
+	require.EqualValues(t, 1000, auth.Available)
 }
 
 // TestPersistence checks that balances survive a store reopen while

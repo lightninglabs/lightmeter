@@ -50,7 +50,7 @@ flowchart LR
 
     AP -->|"pricesrpc gRPC"| RPC
     RPC -->|"ResolveModel, BundleTokens"| TBL
-    RPC -->|"Book, Authorize, Get, Debit"| SQL
+    RPC -->|"Book, Authorize, RecordPayment, Get, DebitUsage"| SQL
     JAN -->|"ExpireStale(ttl)"| SQL
     FLU -->|"Flush (no-op)"| SQL
     TBL --> BTC
@@ -141,7 +141,7 @@ aperture commit; lightmeter's side of each call is in the third column.
 | `GetPrice` | A request arrives with no credential and aperture needs a quote for the 402 challenge. | `ResolveModel`, `BundleTokens` | none | `PriceSats` for a full bundle. `InvalidArgument` when the model is unknown or unreadable. |
 | `ChallengeMinted` | Aperture minted a challenge for the quoted price. | `ResolveModel`, `BundleTokens` | `Book(tokenID, model, tokens, priceSats)` | Empty response. `Book` is idempotent per token ID. |
 | `AuthorizeRequest` | A request carries a valid L402 credential. | `ResolveModel` (model guard, denial quote), `BundleTokens` | `Get`, `Authorize(tokenID, estimate)` | `Allowed` with `ReservedEstimate`, or a denial with `PriceSats` and `Reason`. |
-| `ReportUsage` | The response finished, or the stream was cut. | `ResolveModel` (booked model's rates) | `Get`, `Debit(tokenID, tokens, release)` | `DebitedSats`, `RemainingSats`. |
+| `ReportUsage` | The response finished, or the stream was cut. | `ResolveModel` (booked model's rates) | `Get`, `DebitUsage(tokenID, release, record)` | `DebitedSats`, `RemainingSats`. |
 
 `QuoteSession` and `SettleSession` (`meterd/session.go`) are also served by the
 same `meterd.Server` for aperture's session payment scheme. They book nothing
@@ -193,7 +193,7 @@ stateDiagram-v2
     Booked --> Evicted: evictOldestUnauthorizedLocked<br/>count > MaxUnauthorized and older than MinEvictionAge
     Booked --> Expired: ExpireStale(ttl) from janitor<br/>authorized = 0 and age > ttl
     Booked --> Active: AuthorizeRequest -> SQLiteStore.Authorize<br/>authorized = 1
-    Active --> Active: ReportUsage -> SQLiteStore.Debit<br/>remaining -= debit, usage_events row
+    Active --> Active: ReportUsage -> SQLiteStore.DebitUsage<br/>remaining -= debit, usage_events row
     Active --> Exhausted: Debit clamps remaining at 0 (MAX)<br/>or reservations cover remaining
     Exhausted --> [*]: AuthorizeRequest denies with PriceSats,<br/>buyer pays a new challenge
     Evicted --> [*]
@@ -234,7 +234,7 @@ sequenceDiagram
     A->>U: proxied request with provider key
     U-->>A: streamed response
     A->>M: ReportUsage(tokenId, responseTail, reservedEstimate)
-    M->>S: Debit(tokenId, tokens, releaseEstimate)
+    M->>S: DebitUsage(tokenId, releaseEstimate, record)
     Note over S: one tx: UPDATE bundles, INSERT usage_events
     U->>W: POST /webhooks/baseten, signed billing event
     W->>S: RecordProviderEvent(ev)
@@ -267,8 +267,14 @@ The numbered steps below name the function that performs each one.
    `ceil(2 * (prompt*inMsat + completion*outMsat) / (inMsat + outMsat))` bundle
    tokens; without a split it is the total count; an incomplete successful
    response with bytes but no usage object settles at the reserved estimate.
-   `SQLiteStore.Debit` then releases the reservation, and in one transaction
-   subtracts the debit (clamped at zero) and appends a `usage_events` row.
+   `SQLiteStore.DebitUsage` (the store implements `meterd.UsageLedger`) then
+   releases the reservation, and in one transaction subtracts the debit
+   (clamped at zero) and appends a `usage_events` row that also records how
+   the debit was determined (the split with its rates, a total, or the
+   estimate) and the balance left. On every admitted request the server
+   also hands the store the payment hash of the authorizing credential,
+   kept once per token in `token_payments`. Together they let a seller
+   issue receipts a buyer can recompute.
 5. **Ingest.** Independently, Baseten posts billing events to
    `webhook.Server.handleWebhook`, which stores them in `provider_events`.
 6. **Reconcile.** `GET /recon` calls `SQLiteStore.ReconReport`, which sums
@@ -418,6 +424,20 @@ erDiagram
         TEXT model "copied from bundles.model"
         INTEGER tokens "debit in bundle tokens"
         INTEGER created_at "unix seconds"
+        TEXT source "split, total or estimate; NULL for a plain Debit"
+        INTEGER prompt_tokens "split only"
+        INTEGER cached_tokens "split only"
+        INTEGER completion_tokens "split only"
+        INTEGER total_tokens "total only"
+        INTEGER input_msat_per_ktok "rates of a weighted debit"
+        INTEGER output_msat_per_ktok "rates of a weighted debit"
+        INTEGER cached_input_permille "rates of a weighted debit"
+        INTEGER remaining_tokens "bundle balance after the debit"
+    }
+    token_payments {
+        TEXT token_id PK "first binding wins"
+        TEXT payment_hash "hex, from the authorizing credential"
+        INTEGER created_at "unix seconds"
     }
     provider_events {
         INTEGER id PK "AUTOINCREMENT"
@@ -431,6 +451,7 @@ erDiagram
         TEXT raw "verbatim payload"
     }
     bundles ||--o{ usage_events : "token_id, logical only"
+    bundles ||--o| token_payments : "token_id, logical only"
     usage_events }o--o{ provider_events : "joined by model in ReconReport"
 ```
 

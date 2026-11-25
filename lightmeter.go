@@ -86,18 +86,22 @@ func NewDaemon(ctx context.Context, cfg *Config) (*Daemon, error) {
 	models := make(map[string]*pricing.ModelUSD, len(cfg.Models))
 	for name, m := range cfg.Models {
 		models[name] = &pricing.ModelUSD{
-			InputUSDPerMTok:  m.InputUSDPerMTok,
-			OutputUSDPerMTok: m.OutputUSDPerMTok,
-			BundleTokens:     m.BundleTokens,
+			InputUSDPerMTok:       m.InputUSDPerMTok,
+			OutputUSDPerMTok:      m.OutputUSDPerMTok,
+			CachedInputUSDPerMTok: m.CachedInputUSDPerMTok,
+			BundleTokens:          m.BundleTokens,
+			BundleSats:            m.BundleSats,
 		}
 	}
 
 	var defaultUSD *pricing.ModelUSD
 	if d := cfg.Pricing.DefaultUSD; d != nil {
 		defaultUSD = &pricing.ModelUSD{
-			InputUSDPerMTok:  d.InputUSDPerMTok,
-			OutputUSDPerMTok: d.OutputUSDPerMTok,
-			BundleTokens:     d.BundleTokens,
+			InputUSDPerMTok:       d.InputUSDPerMTok,
+			OutputUSDPerMTok:      d.OutputUSDPerMTok,
+			CachedInputUSDPerMTok: d.CachedInputUSDPerMTok,
+			BundleTokens:          d.BundleTokens,
+			BundleSats:            d.BundleSats,
 		}
 	}
 

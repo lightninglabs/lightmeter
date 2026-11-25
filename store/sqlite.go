@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lightninglabs/aperture/meterd"
+	"github.com/lightningnetwork/lnd/lntypes"
 
 	// Register the pure-Go sqlite driver.
 	_ "modernc.org/sqlite"
@@ -42,6 +43,12 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS usage_events_created_idx
 	ON usage_events (created_at);
 
+CREATE TABLE IF NOT EXISTS token_payments (
+	token_id TEXT PRIMARY KEY,
+	payment_hash TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS provider_events (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	event_id TEXT UNIQUE,
@@ -54,6 +61,65 @@ CREATE TABLE IF NOT EXISTS provider_events (
 	raw TEXT NOT NULL
 );
 `
+
+// usageEventColumns are the usage ledger columns added after the first
+// release. migrate adds the missing ones on every start, so databases created
+// by earlier versions gain them without losing a row. All are nullable: rows
+// written before the migration, or without a usage record, leave them empty.
+var usageEventColumns = []struct{ name, decl string }{
+	// source is how the debit was determined: split, total or estimate.
+	{"source", "TEXT"},
+	{"prompt_tokens", "INTEGER"},
+	{"cached_tokens", "INTEGER"},
+	{"completion_tokens", "INTEGER"},
+	{"total_tokens", "INTEGER"},
+
+	// The rates a weighted debit was computed with.
+	{"input_msat_per_ktok", "INTEGER"},
+	{"output_msat_per_ktok", "INTEGER"},
+	{"cached_input_permille", "INTEGER"},
+
+	// remaining_tokens is the bundle balance right after the debit.
+	{"remaining_tokens", "INTEGER"},
+}
+
+// migrate adds the usage ledger columns missing from usage_events.
+func migrate(db *sql.DB) error {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info('usage_events')`)
+	if err != nil {
+		return err
+	}
+
+	have := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	for _, col := range usageEventColumns {
+		if have[col.name] {
+			continue
+		}
+
+		_, err := db.Exec(fmt.Sprintf(
+			"ALTER TABLE usage_events ADD COLUMN %s %s",
+			col.name, col.decl,
+		))
+		if err != nil {
+			return fmt.Errorf("unable to add column %s: %w",
+				col.name, err)
+		}
+	}
+
+	return nil
+}
 
 // ProviderEvent is one upstream billing event ingested through the webhook
 // receiver.
@@ -152,6 +218,10 @@ type SQLiteStore struct {
 	mtx      sync.Mutex
 	reserved map[string][]reservation
 
+	// paid caches the tokens whose payment hash is already recorded, so
+	// the binding costs one write per token rather than one per request.
+	paid map[string]struct{}
+
 	cfg StoreConfig
 
 	// lastPrune is when the event retention sweep last ran.
@@ -159,7 +229,11 @@ type SQLiteStore struct {
 }
 
 // A compile-time check that SQLiteStore satisfies meterd.Store.
-var _ meterd.Store = (*SQLiteStore)(nil)
+var (
+	_ meterd.Store              = (*SQLiteStore)(nil)
+	_ meterd.ReservationExpirer = (*SQLiteStore)(nil)
+	_ meterd.UsageLedger        = (*SQLiteStore)(nil)
+)
 
 // NewSQLiteStore opens (creating when necessary) the configured database
 // and applies the schema.
@@ -193,6 +267,11 @@ func NewSQLiteStore(cfg StoreConfig) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("unable to apply schema: %w", err)
 	}
 
+	if err := migrate(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("unable to migrate schema: %w", err)
+	}
+
 	// A second handle serves the reconciliation report's read-only
 	// scans without taking the metering mutex or the writer
 	// connection.
@@ -214,6 +293,7 @@ func NewSQLiteStore(cfg StoreConfig) (*SQLiteStore, error) {
 		db:       db,
 		rdb:      rdb,
 		reserved: make(map[string][]reservation),
+		paid:     make(map[string]struct{}),
 		cfg:      cfg,
 	}, nil
 }
@@ -368,8 +448,8 @@ func (s *SQLiteStore) evictOldestUnauthorizedLocked() error {
 // to be allowed, reserves the given estimated per-request cost against its
 // balance to bound concurrent overdraw. It returns the tokens available
 // after existing reservations and whether the token is known.
-func (s *SQLiteStore) Authorize(tokenID string, estimate int64) (int64, bool,
-	error) {
+func (s *SQLiteStore) Authorize(tokenID string,
+	estimate int64) (meterd.Authorization, bool, error) {
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -385,16 +465,11 @@ func (s *SQLiteStore) Authorize(tokenID string, estimate int64) (int64, bool,
 	).Scan(&remaining, &authorized)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return 0, false, nil
+		return meterd.Authorization{}, false, nil
 
 	case err != nil:
-		return 0, false, err
+		return meterd.Authorization{}, false, err
 	}
-
-	// The available balance already nets out the tokens reserved by
-	// other in-flight requests, so N concurrent requests on a
-	// near-empty bundle cannot all authorize.
-	available := remaining - s.reservedLocked(tokenID)
 
 	if !authorized {
 		_, err := s.db.Exec(
@@ -403,20 +478,35 @@ func (s *SQLiteStore) Authorize(tokenID string, estimate int64) (int64, bool,
 			tokenID,
 		)
 		if err != nil {
-			return 0, false, err
+			return meterd.Authorization{}, false, err
 		}
 	}
 
-	// Reserve the estimate only when the request is going to be
-	// allowed, so a denied request does not tie up balance.
-	if available > 0 && estimate > 0 {
+	// The available balance nets out the tokens reserved by other
+	// in-flight requests, so N concurrent requests on a near-empty bundle
+	// cannot all be admitted. meterd.AdmitReservation decides admission,
+	// and the estimate is reserved only for an admitted request.
+	reserved := s.reservedLocked(tokenID)
+	auth := meterd.Authorization{
+		Remaining: remaining,
+		Available: remaining - reserved,
+		Admitted:  meterd.AdmitReservation(remaining, reserved, estimate),
+	}
+	if auth.Admitted && estimate > 0 {
 		s.reserved[tokenID] = append(
 			s.reserved[tokenID],
 			reservation{amount: estimate, at: time.Now()},
 		)
 	}
 
-	return available, true, nil
+	return auth, true, nil
+}
+
+// ReservationsExpire reports that reservations whose usage report never
+// arrives are dropped after maxReservationAge, so meterd may tell a buyer
+// whose funded bundle is fully reserved to retry later.
+func (s *SQLiteStore) ReservationsExpire() bool {
+	return true
 }
 
 // Get returns a copy of the token's bundle.
@@ -465,6 +555,66 @@ func (s *SQLiteStore) getLocked(tokenID string) (meterd.Bundle, error) {
 // its ledger row.
 func (s *SQLiteStore) Debit(tokenID string, tokens,
 	releaseEstimate int64) (meterd.Bundle, bool, error) {
+
+	return s.debit(tokenID, tokens, releaseEstimate, nil)
+}
+
+// DebitUsage is Debit for usage.Tokens that also stores the usage behind the
+// debit in the ledger row, so receipts can show how it was computed.
+func (s *SQLiteStore) DebitUsage(tokenID string, releaseEstimate int64,
+	usage meterd.UsageRecord) (meterd.Bundle, bool, error) {
+
+	return s.debit(tokenID, usage.Tokens, releaseEstimate, &usage)
+}
+
+// RecordPayment binds a token to the payment hash of the credential that
+// authorized it. The first binding wins and later calls are no-ops.
+func (s *SQLiteStore) RecordPayment(tokenID string,
+	paymentHash lntypes.Hash) error {
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	if _, ok := s.paid[tokenID]; ok {
+		return nil
+	}
+
+	_, err := s.db.Exec(`
+		INSERT OR IGNORE INTO token_payments (
+			token_id, payment_hash, created_at
+		) VALUES (?, ?, ?)`,
+		tokenID, paymentHash.String(), time.Now().Unix(),
+	)
+	if err != nil {
+		return err
+	}
+	s.paid[tokenID] = struct{}{}
+
+	return nil
+}
+
+// PaymentHash returns the payment hash recorded for the token.
+func (s *SQLiteStore) PaymentHash(tokenID string) (lntypes.Hash, bool) {
+	var hash string
+	err := s.rdb.QueryRow(
+		`SELECT payment_hash FROM token_payments WHERE token_id = ?`,
+		tokenID,
+	).Scan(&hash)
+	if err != nil {
+		return lntypes.Hash{}, false
+	}
+
+	h, err := lntypes.MakeHashFromStr(hash)
+	if err != nil {
+		return lntypes.Hash{}, false
+	}
+
+	return h, true
+}
+
+// debit implements Debit and DebitUsage; usage is nil for a plain Debit.
+func (s *SQLiteStore) debit(tokenID string, tokens, releaseEstimate int64,
+	usage *meterd.UsageRecord) (meterd.Bundle, bool, error) {
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -533,11 +683,18 @@ func (s *SQLiteStore) Debit(tokenID string, tokens,
 	// Append the consumption to the usage ledger. The ledger is what
 	// the reconciliation report compares against the provider's
 	// billing events.
+	cols := usageColumns(usage)
 	_, err = tx.Exec(`
 		INSERT INTO usage_events (
-			token_id, model, tokens, created_at
-		) VALUES (?, ?, ?, ?)`,
+			token_id, model, tokens, created_at, remaining_tokens,
+			source, prompt_tokens, cached_tokens,
+			completion_tokens, total_tokens, input_msat_per_ktok,
+			output_msat_per_ktok, cached_input_permille
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		tokenID, b.Model, tokens, time.Now().Unix(),
+		b.RemainingTokens, cols.source, cols.prompt, cols.cached,
+		cols.completion, cols.total, cols.inRate, cols.outRate,
+		cols.cachedPermille,
 	)
 	if err != nil {
 		return meterd.Bundle{}, false, err
@@ -548,6 +705,42 @@ func (s *SQLiteStore) Debit(tokenID string, tokens,
 	}
 
 	return b, true, nil
+}
+
+// ledgerColumns are a usage record's values for the usage_events row, nil
+// where the record does not apply.
+type ledgerColumns struct {
+	source                          any
+	prompt, cached, completion      any
+	total                           any
+	inRate, outRate, cachedPermille any
+}
+
+// usageColumns maps a usage record onto the ledger columns. A nil record, a
+// plain Debit, leaves them all empty.
+func usageColumns(u *meterd.UsageRecord) ledgerColumns {
+	if u == nil {
+		return ledgerColumns{}
+	}
+
+	cols := ledgerColumns{source: u.Source.String()}
+	switch u.Source {
+	case meterd.UsageSplit:
+		cols.prompt = u.PromptTokens
+		cols.cached = u.CachedTokens
+		cols.completion = u.CompletionTokens
+
+		if u.Weighted {
+			cols.inRate = u.InputMsatPerThousandTokens
+			cols.outRate = u.OutputMsatPerThousandTokens
+			cols.cachedPermille = u.CachedInputPermille
+		}
+
+	case meterd.UsageTotal:
+		cols.total = u.TotalTokens
+	}
+
+	return cols
 }
 
 // ExpireStale removes bundles that were never used by an authorized request
